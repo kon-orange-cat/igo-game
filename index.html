@@ -1,0 +1,1477 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7×7 テリトリー</title>
+
+<style>
+    body {
+        font-family: sans-serif;
+        text-align: center;
+        background: #f5f5f5;
+    }
+
+    h1 {
+        margin-top: 25px;
+    }
+
+    #board {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        width: min(84vw, 420px);
+        aspect-ratio: 1 / 1;
+        margin: 25px auto;
+        background: #d9a85b;
+        border: 2px solid #654321;
+    }
+
+    .point {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+    }
+
+    .point::before {
+        content: "";
+        position: absolute;
+        width: 100%;
+        height: 1px;
+        background: #654321;
+    }
+
+    .point::after {
+        content: "";
+        position: absolute;
+        width: 1px;
+        height: 100%;
+        background: #654321;
+    }
+
+    .stone {
+        width: 78%;
+        height: 78%;
+        border-radius: 50%;
+        z-index: 1;
+    }
+
+    .black {
+        background: #111;
+    }
+
+    .white {
+        background: #fff;
+        border: 1px solid #777;
+        box-sizing: border-box;
+    }
+
+    /* 地の候補を色分けする */
+    .territory-black {
+        background: rgba(0, 0, 0, 0.22);
+    }
+
+    .territory-white {
+        background: rgba(255, 255, 255, 0.8);
+    }
+
+    .territory-neutral {
+        background: rgba(150, 150, 150, 0.35);
+    }
+
+    #status, #result, #territoryResult {
+        margin: 12px;
+        font-size: 16px;
+    }
+
+    #passButton {
+        padding: 10px 30px;
+        font-size: 16px;
+        cursor: pointer;
+        margin: 10px;
+    }
+
+    #passButton:disabled {
+        cursor: not-allowed;
+    }
+
+    #territoryResult {
+        line-height: 1.8;
+    }
+</style>
+</head>
+
+<body>
+
+<h1>7×7 テリトリー</h1>
+
+<div id="status">あなた（黒）の番です</div>
+<div id="cpuInfo">あなた：黒 ／ CPU：白</div>
+<div style="margin:8px"><label for="cpuLevel">CPUの強さ：</label><select id="cpuLevel"><option value="beginner">初級（従来型）</option><option value="intermediate" selected>中級（数手先を読む）</option></select></div>
+
+<div id="board"></div>
+
+<button id="passButton" onclick="passTurn()">パス</button>
+<button id="undoButton" onclick="undoLastRound()" disabled>待った</button>
+
+<div id="result">今回捕獲した石：0個</div>
+
+<div id="territoryResult"></div>
+
+<script>
+    // 盤面の大きさ
+    const SIZE = 7;
+
+    // 盤面データ
+    // null = 空き、black = 黒石、white = 白石
+    let boardData = Array.from(
+        { length: SIZE },
+        () => Array(SIZE).fill(null)
+    );
+
+    // 地の分類結果を保存する配列
+    let territoryData = Array.from(
+        { length: SIZE },
+        () => Array(SIZE).fill(null)
+    );
+
+    // 現在の手番
+    let currentPlayer = "black";
+
+    // 人間とCPUの担当色
+    const humanPlayer = "black";
+    const cpuPlayer = "white";
+
+    // CPUが考えている間の二重操作を防ぐ
+    let cpuThinking = false;
+
+    // 単純コウで再現を禁止する盤面
+    let koForbiddenPosition = null;
+
+    // 連続パス回数
+    let consecutivePasses = 0;
+
+    // これまでに捕獲した石の合計
+    // black = 黒が捕獲した白石、white = 白が捕獲した黒石
+    let capturedStones = {
+        black: 0,
+        white: 0
+    };
+
+    // 終局時に死に石として取り除いた石の数
+    let finalDeadStones = {
+        black: 0,
+        white: 0
+    };
+
+    // 対局終了状態
+    let gameOver = false;
+
+    // 待った用：人間が行動する直前の状態を保存する
+    // CPUの応答が終わったあと、この状態に戻すことで両者の手を取り消す
+    let roundUndoSnapshot = null;
+    let undoAvailable = false;
+
+    // 効果音用の Web Audio API
+    // ブラウザの自動再生制限があるため、最初のユーザー操作で音声を有効にする
+    let audioContext = null;
+    let audioStarted = false;
+
+    function ensureAudioContext() {
+        if (!audioContext) {
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) return null;
+            audioContext = new AudioContextClass();
+        }
+        return audioContext;
+    }
+
+    // 短い電子音を1音鳴らす
+    function playTone(frequency, startTime, duration, volume = 0.07, type = "sine") {
+        if (!audioContext) return;
+
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+
+        oscillator.type = type;
+        oscillator.frequency.setValueAtTime(frequency, startTime);
+        gain.gain.setValueAtTime(0.0001, startTime);
+        gain.gain.exponentialRampToValueAtTime(volume, startTime + 0.012);
+        gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+
+        oscillator.connect(gain);
+        gain.connect(audioContext.destination);
+        oscillator.start(startTime);
+        oscillator.stop(startTime + duration + 0.02);
+    }
+
+    // 石を置いたとき：Windowsの通知音を思わせる短い「ポン」
+    function playStoneSound() {
+        if (!audioContext || audioContext.state !== "running") return;
+        const now = audioContext.currentTime;
+        playTone(740, now, 0.075, 0.075, "triangle");
+        playTone(990, now + 0.018, 0.055, 0.035, "sine");
+    }
+
+    // ゲーム開始時：明るく上昇するチャイム
+    function playGameStartSound() {
+        if (!audioContext || audioContext.state !== "running") return;
+        const now = audioContext.currentTime + 0.22;
+        [523.25, 659.25, 783.99, 1046.5].forEach((frequency, index) => {
+            playTone(frequency, now + index * 0.13, 0.24, 0.055, "sine");
+        });
+    }
+
+    // ゲーム終了時：落ち着いて下降するチャイム
+    function playGameEndSound() {
+        if (!audioContext || audioContext.state !== "running") return;
+        const now = audioContext.currentTime + 0.03;
+        [783.99, 659.25, 523.25, 392.00].forEach((frequency, index) => {
+            playTone(frequency, now + index * 0.16, 0.28, 0.06, "sine");
+        });
+    }
+
+    // パスしたとき：控えめな短い確認音
+    function playPassSound() {
+        if (!audioContext || audioContext.state !== "running") return;
+        const now = audioContext.currentTime;
+        playTone(440, now, 0.09, 0.045, "sine");
+        playTone(554.37, now + 0.07, 0.10, 0.035, "sine");
+    }
+
+    // 待ったを押したとき：下降する短い電子音
+    function playUndoSound() {
+        if (!audioContext || audioContext.state !== "running") return;
+        const now = audioContext.currentTime;
+        playTone(659.25, now, 0.10, 0.05, "triangle");
+        playTone(440, now + 0.09, 0.13, 0.045, "triangle");
+    }
+
+    // 最初のクリックで音声を有効化し、ゲーム開始音を1回だけ鳴らす
+    document.addEventListener("pointerdown", async function startAudioOnce() {
+        if (audioStarted) return;
+        audioStarted = true;
+
+        const context = ensureAudioContext();
+        if (!context) return;
+
+        try {
+            await context.resume();
+            playGameStartSound();
+        } catch (error) {
+            console.warn("音声を有効にできませんでした。", error);
+        }
+    }, { once: true });
+
+    // 上下左右の方向
+    const directions = [
+        [-1, 0],
+        [1, 0],
+        [0, -1],
+        [0, 1]
+    ];
+
+    // 盤面を画面に表示する
+    function renderBoard() {
+        const board = document.getElementById("board");
+        board.innerHTML = "";
+
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                const point = document.createElement("div");
+                point.className = "point";
+
+                const stoneColor = boardData[row][col];
+
+                // 空き交点なら地の分類色を表示
+                if (stoneColor === null) {
+                    const territory = territoryData[row][col];
+
+                    if (territory === "black") {
+                        point.classList.add("territory-black");
+                    } else if (territory === "white") {
+                        point.classList.add("territory-white");
+                    } else if (territory === "neutral") {
+                        point.classList.add("territory-neutral");
+                    }
+                }
+
+                // 石があれば表示
+                if (stoneColor !== null) {
+                    const stone = document.createElement("div");
+                    stone.className = "stone " + stoneColor;
+                    point.appendChild(stone);
+                }
+
+                point.addEventListener("click", () => {
+                    placeStone(row, col);
+                });
+
+                board.appendChild(point);
+            }
+        }
+    }
+
+    // 盤面をコピーする
+    function copyBoard(board) {
+        return board.map(line => line.slice());
+    }
+
+    // 待った用に、ゲームの状態をまとめて保存する
+    function createGameSnapshot() {
+        return {
+            boardData: copyBoard(boardData),
+            territoryData: copyBoard(territoryData),
+            currentPlayer,
+            koForbiddenPosition: koForbiddenPosition === null ? null : copyBoard(koForbiddenPosition),
+            consecutivePasses,
+            capturedStones: { ...capturedStones },
+            finalDeadStones: { ...finalDeadStones },
+            gameOver,
+            statusText: document.getElementById("status").textContent,
+            resultText: document.getElementById("result").textContent,
+            territoryResultHTML: document.getElementById("territoryResult").innerHTML
+        };
+    }
+
+    // 保存した状態に戻す
+    function restoreGameSnapshot(snapshot) {
+        boardData = copyBoard(snapshot.boardData);
+        territoryData = copyBoard(snapshot.territoryData);
+        currentPlayer = snapshot.currentPlayer;
+        koForbiddenPosition = snapshot.koForbiddenPosition === null ? null : copyBoard(snapshot.koForbiddenPosition);
+        consecutivePasses = snapshot.consecutivePasses;
+        capturedStones = { ...snapshot.capturedStones };
+        finalDeadStones = { ...snapshot.finalDeadStones };
+        gameOver = snapshot.gameOver;
+        cpuThinking = false;
+
+        document.getElementById("status").textContent = snapshot.statusText;
+        document.getElementById("result").textContent = snapshot.resultText;
+        document.getElementById("territoryResult").innerHTML = snapshot.territoryResultHTML;
+        document.getElementById("passButton").disabled = false;
+        renderBoard();
+    }
+
+    // 待ったボタンの有効・無効を更新する
+    function updateUndoButton() {
+        document.getElementById("undoButton").disabled = !undoAvailable || cpuThinking;
+    }
+
+    // 人間の直前の手と、それに対するCPUの手をまとめて取り消す
+    function undoLastRound() {
+        if (!undoAvailable || !roundUndoSnapshot || cpuThinking) return;
+
+        restoreGameSnapshot(roundUndoSnapshot);
+        playUndoSound();
+        roundUndoSnapshot = null;
+        undoAvailable = false;
+        updateUndoButton();
+        document.getElementById("result").textContent = "直前のあなたとCPUの手を取り消しました。";
+    }
+
+    // 盤面が完全に同じか比較する
+    function boardsEqual(boardA, boardB) {
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                if (boardA[row][col] !== boardB[row][col]) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    // 人間が石を置く
+    function placeStone(row, col) {
+        if (gameOver || cpuThinking || currentPlayer !== humanPlayer) {
+            return;
+        }
+
+        const snapshot = createGameSnapshot();
+        if (playMove(row, col)) {
+            roundUndoSnapshot = snapshot;
+            undoAvailable = false;
+            updateUndoButton();
+            changeTurn();
+            scheduleCpuTurn();
+        }
+    }
+
+    // 実際に石を置く共通処理（人間・CPUの両方が使う）
+    function playMove(row, col) {
+        if (gameOver || boardData[row][col] !== null) {
+            return false;
+        }
+
+        const previousBoard = copyBoard(boardData);
+
+        boardData[row][col] = currentPlayer;
+
+        const capturedCount = captureOpponent(
+            currentPlayer,
+            row,
+            col
+        );
+
+        const myGroup = findGroup(row, col);
+        const myLiberties = findLiberties(myGroup);
+
+        // 自殺手の判定
+        if (myLiberties.length === 0) {
+            boardData = previousBoard;
+            renderBoard();
+
+            document.getElementById("result").textContent =
+                "自殺手なので置けません。今回の着手は取り消されました。";
+
+            return false;
+        }
+
+        // 単純コウの判定
+        if (
+            koForbiddenPosition !== null &&
+            boardsEqual(boardData, koForbiddenPosition)
+        ) {
+            boardData = previousBoard;
+            renderBoard();
+
+            document.getElementById("result").textContent =
+                "コウのルールにより、すぐに取り返すことはできません。";
+
+            return false;
+        }
+
+        const atariGroups = findAdjacentAtariGroups(
+            currentPlayer,
+            row,
+            col
+        );
+
+        // 合法手なので、今回捕獲した石を累計に加える
+        capturedStones[currentPlayer] += capturedCount;
+
+        // 合法手なので、今回の着手前の盤面を保存
+        koForbiddenPosition = previousBoard;
+
+        // 石を置いたので連続パスをリセット
+        consecutivePasses = 0;
+
+        // 盤面を更新
+        renderBoard();
+
+        // 合法手で石を置けたときだけ効果音を鳴らす（人間・CPU共通）
+        playStoneSound();
+
+        let message = "今回捕獲した石：" + capturedCount + "個";
+
+        if (atariGroups.length > 0) {
+            message += " ／ アタリ！";
+
+            for (const group of atariGroups) {
+                const positions = group.map(
+                    stone => "(" +
+                    (stone.row + 1) + "," +
+                    (stone.col + 1) + ")"
+                );
+
+                message += " 相手のグループ：" +
+                    positions.join("、");
+            }
+        }
+
+        document.getElementById("result").textContent = message;
+
+        return true;
+    }
+
+    // 人間がパスする
+    function passTurn() {
+        if (gameOver || cpuThinking || currentPlayer !== humanPlayer) {
+            return;
+        }
+
+        roundUndoSnapshot = createGameSnapshot();
+        undoAvailable = false;
+        updateUndoButton();
+        playPassSound();
+        registerPass(humanPlayer);
+
+        if (!gameOver) {
+            changeTurn();
+            scheduleCpuTurn();
+        }
+    }
+
+    // パスを記録する（人間・CPU共通）
+    function registerPass(player) {
+        consecutivePasses++;
+
+        // パスによってコウの禁止状態を解除
+        koForbiddenPosition = null;
+
+        if (consecutivePasses >= 2) {
+            gameOver = true;
+            cpuThinking = false;
+
+            // 対局終了音（2回連続パスで終局したときに1回だけ鳴る）
+            playGameEndSound();
+
+            document.getElementById("status").textContent =
+                "対局終了";
+            document.getElementById("passButton").disabled = true;
+
+            // 終局時に死に石を取り除き、相手の捕獲数に加える
+            const removedDeadStones = resolveDeadStones();
+
+            // 死に石を取り除いた盤面で地と得点を計算する
+            analyzeTerritories();
+
+            document.getElementById("result").textContent =
+                colorName(player) + "がパスし、対局が終了しました。" +
+                " ／ 終局時に取り除いた死に石：黒 " +
+                removedDeadStones.black + "個、白 " +
+                removedDeadStones.white + "個";
+            return;
+        }
+
+        document.getElementById("result").textContent =
+            colorName(player) + "がパスしました。";
+    }
+
+    // 手番を交代する
+    function changeTurn() {
+        currentPlayer =
+            currentPlayer === "black" ? "white" : "black";
+
+        updateTurnStatus();
+    }
+
+    // 現在の手番を画面に表示する
+    function updateTurnStatus() {
+        if (gameOver) {
+            document.getElementById("status").textContent = "対局終了";
+        } else if (currentPlayer === humanPlayer) {
+            document.getElementById("status").textContent = "あなた（黒）の番です";
+        } else {
+            document.getElementById("status").textContent = "CPU（白）が考えています...";
+        }
+    }
+
+    // CPUの手番を少し遅らせて開始する
+    function scheduleCpuTurn() {
+        if (!gameOver && currentPlayer === cpuPlayer) {
+            cpuThinking = true;
+            document.getElementById("passButton").disabled = true;
+            updateTurnStatus();
+            setTimeout(cpuTurn, 450);
+        }
+    }
+
+    // CPUの着手を決める
+    function cpuTurn() {
+        if (gameOver || currentPlayer !== cpuPlayer) {
+            cpuThinking = false;
+            return;
+        }
+
+        const move = chooseCpuMove();
+
+        if (move === null) {
+            cpuThinking = false;
+            playPassSound();
+            registerPass(cpuPlayer);
+
+            if (!gameOver) {
+                changeTurn();
+                document.getElementById("passButton").disabled = false;
+            }
+            undoAvailable = roundUndoSnapshot !== null;
+            updateUndoButton();
+            return;
+        }
+
+        const success = playMove(move.row, move.col);
+        cpuThinking = false;
+
+        if (success) {
+            changeTurn();
+            document.getElementById("passButton").disabled = false;
+        } else {
+            // 念のため、選んだ手が成立しなければパスする
+            playPassSound();
+            registerPass(cpuPlayer);
+            if (!gameOver) {
+                changeTurn();
+                document.getElementById("passButton").disabled = false;
+            }
+        }
+
+        // CPUの応答（着手またはパス）が終わったので、待ったを許可する
+        undoAvailable = roundUndoSnapshot !== null;
+        updateUndoButton();
+    }
+
+    // CPUが合法手の中から候補を選ぶ
+    // 初級は従来の一手評価、中級はミニマックス法で3手先まで読む
+    function chooseCpuMove() {
+        const level = document.getElementById("cpuLevel")?.value || "intermediate";
+        if (level === "beginner") {
+            return chooseBeginnerMove();
+        }
+        return chooseIntermediateMove();
+    }
+
+    // 従来の簡易CPUを初級として残す
+    function chooseBeginnerMove() {
+        let bestMove = null;
+        let bestScore = -Infinity;
+
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                if (boardData[row][col] !== null) continue;
+                const before = copyBoard(boardData);
+                boardData[row][col] = cpuPlayer;
+                const captured = captureOpponent(cpuPlayer, row, col);
+                const liberties = findLiberties(findGroup(row, col));
+                const isKo = koForbiddenPosition !== null && boardsEqual(boardData, koForbiddenPosition);
+                if (liberties.length === 0 || isKo) {
+                    boardData = before;
+                    continue;
+                }
+                let score = captured * 30;
+                score += liberties.length === 1 ? -18 : Math.min(liberties.length, 5) * 0.7;
+                for (const [dr, dc] of directions) {
+                    const nr = row + dr, nc = col + dc;
+                    if (nr < 0 || nr >= SIZE || nc < 0 || nc >= SIZE) continue;
+                    if (before[nr][nc] === cpuPlayer) score += 1.8;
+                    else if (before[nr][nc] === humanPlayer && boardData[nr][nc] === humanPlayer) {
+                        const enemyLiberties = findLiberties(findGroup(nr, nc));
+                        score += enemyLiberties.length === 1 ? 5 : 0.8;
+                    }
+                }
+                const centerDistance = Math.abs(row - 3) + Math.abs(col - 3);
+                score += Math.max(0, 2.5 - centerDistance * 0.45);
+                score += Math.random() * 0.3;
+                boardData = before;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMove = { row, col };
+                }
+            }
+        }
+        return bestScore < 1.2 ? null : bestMove;
+    }
+
+    // 指定盤面上のグループを探索する（探索中に実際の盤面を変更しない）
+    function searchFindGroup(board, row, col) {
+        const color = board[row][col];
+        const stack = [{ row, col }];
+        const visited = new Set();
+        const group = [];
+        while (stack.length) {
+            const p = stack.pop();
+            const key = p.row + "," + p.col;
+            if (visited.has(key)) continue;
+            visited.add(key);
+            group.push(p);
+            for (const [dr, dc] of directions) {
+                const r = p.row + dr, c = p.col + dc;
+                if (r >= 0 && r < SIZE && c >= 0 && c < SIZE && board[r][c] === color) {
+                    stack.push({ row: r, col: c });
+                }
+            }
+        }
+        return group;
+    }
+
+    function searchLiberties(board, group) {
+        const liberties = new Set();
+        for (const p of group) {
+            for (const [dr, dc] of directions) {
+                const r = p.row + dr, c = p.col + dc;
+                if (r >= 0 && r < SIZE && c >= 0 && c < SIZE && board[r][c] === null) {
+                    liberties.add(r + "," + c);
+                }
+            }
+        }
+        return liberties.size;
+    }
+
+    // 探索用の着手。合法なら新しい盤面を返し、違法ならnull
+    function searchPlay(board, row, col, player, forbiddenBoard) {
+        if (board[row][col] !== null) return null;
+        const next = copyBoard(board);
+        next[row][col] = player;
+        const opponent = player === "black" ? "white" : "black";
+        let captured = 0;
+        const checked = new Set();
+        for (const [dr, dc] of directions) {
+            const r = row + dr, c = col + dc;
+            if (r < 0 || r >= SIZE || c < 0 || c >= SIZE || next[r][c] !== opponent) continue;
+            const key = r + "," + c;
+            if (checked.has(key)) continue;
+            const group = searchFindGroup(next, r, c);
+            for (const stone of group) checked.add(stone.row + "," + stone.col);
+            if (searchLiberties(next, group) === 0) {
+                for (const stone of group) {
+                    next[stone.row][stone.col] = null;
+                    captured++;
+                }
+            }
+        }
+        if (searchLiberties(next, searchFindGroup(next, row, col)) === 0) return null;
+        if (forbiddenBoard && boardsEqual(next, forbiddenBoard)) return null;
+        return { board: next, captured };
+    }
+
+    // 盤面をCPU側から評価する。大きいほどCPU（白）に有利
+    function evaluateSearchBoard(board, capturedForCpu, capturedForHuman) {
+        let score = (capturedForCpu - capturedForHuman) * 2.2;
+        const visited = new Set();
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                const color = board[row][col];
+                if (color !== null) {
+                    const key = row + "," + col;
+                    if (!visited.has(key)) {
+                        const group = searchFindGroup(board, row, col);
+                        for (const p of group) visited.add(p.row + "," + p.col);
+                        const libs = searchLiberties(board, group);
+                        const sign = color === cpuPlayer ? 1 : -1;
+                        score += sign * (group.length * 0.45 + Math.min(libs, 5) * 0.9);
+                        if (libs === 1) score -= sign * (group.length * 2.5 + 5);
+                        else if (libs === 2) score -= sign * (group.length * 0.7);
+                    }
+                    continue;
+                }
+                // 空き領域の境界色を調べ、単色に接していれば地として評価
+                const stack = [{ row, col }];
+                const region = [];
+                const border = new Set();
+                while (stack.length) {
+                    const p = stack.pop();
+                    const key = p.row + "," + p.col;
+                    if (visited.has(key)) continue;
+                    visited.add(key);
+                    region.push(p);
+                    for (const [dr, dc] of directions) {
+                        const r = p.row + dr, c = p.col + dc;
+                        if (r < 0 || r >= SIZE || c < 0 || c >= SIZE) continue;
+                        if (board[r][c] === null) stack.push({ row: r, col: c });
+                        else border.add(board[r][c]);
+                    }
+                }
+                if (border.size === 1) score += (border.has(cpuPlayer) ? 1 : -1) * region.length * 0.8;
+            }
+        }
+        return score;
+    }
+
+    // 候補手を評価順に並べ、探索対象を上位だけに絞る
+    function getSearchCandidates(board, player, forbiddenBoard, limit) {
+        const candidates = [];
+        let hasStone = false;
+        for (let r = 0; r < SIZE; r++) for (let c = 0; c < SIZE; c++) if (board[r][c] !== null) hasStone = true;
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                if (board[row][col] !== null) continue;
+                // 石がある局面では、既存の石から離れすぎた着手を候補から除外
+                if (hasStone) {
+                    let near = false;
+                    for (let r = Math.max(0, row - 2); r <= Math.min(SIZE - 1, row + 2); r++) {
+                        for (let c = Math.max(0, col - 2); c <= Math.min(SIZE - 1, col + 2); c++) {
+                            if (board[r][c] !== null) near = true;
+                        }
+                    }
+                    if (!near) continue;
+                }
+                const result = searchPlay(board, row, col, player, forbiddenBoard);
+                if (!result) continue;
+                const score = evaluateSearchBoard(result.board,
+                    player === cpuPlayer ? result.captured : 0,
+                    player === humanPlayer ? result.captured : 0);
+                candidates.push({ row, col, board: result.board, captured: result.captured, orderScore: score });
+            }
+        }
+        candidates.sort((a, b) => player === cpuPlayer ? b.orderScore - a.orderScore : a.orderScore - b.orderScore);
+        return candidates.slice(0, limit);
+    }
+
+    // ミニマックス法＋アルファベータ枝刈りによる中級CPU
+    // 石を置く手に加え、「パス」も独立した行動として比較する。
+    function chooseIntermediateMove() {
+        const depth = 3;       // CPU・人間・CPUの3手分を読む
+        const branchLimit = 7; // 石を置く候補は従来どおり各局面で最大7手
+        const rootMoves = getSearchCandidates(boardData, cpuPlayer, koForbiddenPosition, branchLimit);
+
+        // まず「今パスする」場合の評価を計算する。
+        // 直前に人間がパスしていれば、ここで2連続パスとなり探索上も終局する。
+        let bestScore;
+        if (consecutivePasses + 1 >= 2) {
+            bestScore = evaluateSearchBoard(
+                boardData,
+                capturedStones.white,
+                capturedStones.black
+            );
+        } else {
+            bestScore = minimaxSearch(
+                boardData,
+                humanPlayer,
+                depth - 1,
+                null, // パスしたのでコウの禁止盤面は解除
+                -Infinity,
+                Infinity,
+                capturedStones.white,
+                capturedStones.black,
+                consecutivePasses + 1
+            );
+        }
+
+        // bestMoveがnullなら、現時点ではパスが最善という意味。
+        let bestMove = null;
+        let alpha = bestScore;
+        const beta = Infinity;
+
+        for (const move of rootMoves) {
+            const score = minimaxSearch(
+                move.board,
+                humanPlayer,
+                depth - 1,
+                boardData,
+                alpha,
+                beta,
+                capturedStones.white + move.captured,
+                capturedStones.black,
+                0 // 石を置いたので連続パスはリセット
+            );
+            if (score > bestScore) {
+                bestScore = score;
+                bestMove = { row: move.row, col: move.col };
+            }
+            alpha = Math.max(alpha, bestScore);
+        }
+        return bestMove;
+    }
+
+    function minimaxSearch(board, player, depth, previousBoard, alpha, beta,
+        cpuCaptured, humanCaptured, passCount) {
+        // 探索上で2回連続パスになった局面は終局として評価する。
+        // 実際の対局の死に石処理・得点処理は既存のregisterPass()側で行う。
+        if (passCount >= 2 || depth <= 0) {
+            return evaluateSearchBoard(board, cpuCaptured, humanCaptured);
+        }
+
+        const moves = getSearchCandidates(board, player, previousBoard, 7);
+
+        if (player === cpuPlayer) {
+            let best = -Infinity;
+
+            // 石を置く選択肢を調べる
+            for (const move of moves) {
+                const score = minimaxSearch(
+                    move.board,
+                    humanPlayer,
+                    depth - 1,
+                    board,
+                    alpha,
+                    beta,
+                    cpuCaptured + move.captured,
+                    humanCaptured,
+                    0
+                );
+                best = Math.max(best, score);
+                alpha = Math.max(alpha, best);
+                if (beta <= alpha) break;
+            }
+
+            // パスする選択肢も比較する。パスでは盤面・捕獲数は変化しない。
+            let passScore;
+            if (passCount + 1 >= 2) {
+                passScore = evaluateSearchBoard(board, cpuCaptured, humanCaptured);
+            } else {
+                passScore = minimaxSearch(
+                    board,
+                    humanPlayer,
+                    depth - 1,
+                    null,
+                    alpha,
+                    beta,
+                    cpuCaptured,
+                    humanCaptured,
+                    passCount + 1
+                );
+            }
+            best = Math.max(best, passScore);
+            return best;
+        } else {
+            let best = Infinity;
+
+            // 人間側も、石を置く手とパスの両方を選べるものとして探索する。
+            for (const move of moves) {
+                const score = minimaxSearch(
+                    move.board,
+                    cpuPlayer,
+                    depth - 1,
+                    board,
+                    alpha,
+                    beta,
+                    cpuCaptured,
+                    humanCaptured + move.captured,
+                    0
+                );
+                best = Math.min(best, score);
+                beta = Math.min(beta, best);
+                if (beta <= alpha) break;
+            }
+
+            let passScore;
+            if (passCount + 1 >= 2) {
+                passScore = evaluateSearchBoard(board, cpuCaptured, humanCaptured);
+            } else {
+                passScore = minimaxSearch(
+                    board,
+                    cpuPlayer,
+                    depth - 1,
+                    null,
+                    alpha,
+                    beta,
+                    cpuCaptured,
+                    humanCaptured,
+                    passCount + 1
+                );
+            }
+            best = Math.min(best, passScore);
+            return best;
+        }
+    }
+
+    // 色を日本語に変換する
+    function colorName(color) {
+        return color === "black" ? "黒" : "白";
+    }
+
+    // 石のグループを探す
+    function findGroup(startRow, startCol) {
+        const color = boardData[startRow][startCol];
+
+        const group = [];
+        const stack = [
+            { row: startRow, col: startCol }
+        ];
+
+        const visited = new Set();
+
+        while (stack.length > 0) {
+            const current = stack.pop();
+
+            const key = current.row + "," + current.col;
+
+            if (visited.has(key)) {
+                continue;
+            }
+
+            visited.add(key);
+            group.push(current);
+
+            for (const [dr, dc] of directions) {
+                const nextRow = current.row + dr;
+                const nextCol = current.col + dc;
+
+                if (
+                    nextRow < 0 || nextRow >= SIZE ||
+                    nextCol < 0 || nextCol >= SIZE
+                ) {
+                    continue;
+                }
+
+                if (boardData[nextRow][nextCol] === color) {
+                    stack.push({
+                        row: nextRow,
+                        col: nextCol
+                    });
+                }
+            }
+        }
+
+        return group;
+    }
+
+    // グループの呼吸点を調べる
+    function findLiberties(group) {
+        const liberties = new Set();
+
+        for (const stone of group) {
+            for (const [dr, dc] of directions) {
+                const nextRow = stone.row + dr;
+                const nextCol = stone.col + dc;
+
+                if (
+                    nextRow < 0 || nextRow >= SIZE ||
+                    nextCol < 0 || nextCol >= SIZE
+                ) {
+                    continue;
+                }
+
+                if (boardData[nextRow][nextCol] === null) {
+                    liberties.add(nextRow + "," + nextCol);
+                }
+            }
+        }
+
+        return Array.from(liberties);
+    }
+
+    // 相手の石を捕獲する
+    function captureOpponent(player, row, col) {
+        const opponent =
+            player === "black" ? "white" : "black";
+
+        let capturedCount = 0;
+        const checkedGroups = new Set();
+
+        for (const [dr, dc] of directions) {
+            const nextRow = row + dr;
+            const nextCol = col + dc;
+
+            if (
+                nextRow < 0 || nextRow >= SIZE ||
+                nextCol < 0 || nextCol >= SIZE
+            ) {
+                continue;
+            }
+
+            if (boardData[nextRow][nextCol] !== opponent) {
+                continue;
+            }
+
+            const key = nextRow + "," + nextCol;
+
+            if (checkedGroups.has(key)) {
+                continue;
+            }
+
+            const group = findGroup(nextRow, nextCol);
+
+            for (const stone of group) {
+                checkedGroups.add(stone.row + "," + stone.col);
+            }
+
+            const liberties = findLiberties(group);
+
+            if (liberties.length === 0) {
+                for (const stone of group) {
+                    boardData[stone.row][stone.col] = null;
+                    capturedCount++;
+                }
+            }
+        }
+
+        return capturedCount;
+    }
+
+    // 相手のアタリを調べる
+    function findAdjacentAtariGroups(player, row, col) {
+        const opponent =
+            player === "black" ? "white" : "black";
+
+        const atariGroups = [];
+        const checkedGroups = new Set();
+
+        for (const [dr, dc] of directions) {
+            const nextRow = row + dr;
+            const nextCol = col + dc;
+
+            if (
+                nextRow < 0 || nextRow >= SIZE ||
+                nextCol < 0 || nextCol >= SIZE
+            ) {
+                continue;
+            }
+
+            if (boardData[nextRow][nextCol] !== opponent) {
+                continue;
+            }
+
+            const key = nextRow + "," + nextCol;
+
+            if (checkedGroups.has(key)) {
+                continue;
+            }
+
+            const group = findGroup(nextRow, nextCol);
+
+            for (const stone of group) {
+                checkedGroups.add(stone.row + "," + stone.col);
+            }
+
+            const liberties = findLiberties(group);
+
+            if (liberties.length === 1) {
+                atariGroups.push(group);
+            }
+        }
+
+        return atariGroups;
+    }
+
+    // 盤面上の空き領域をすべて調べる
+    // targetBoardを使うことで、仮の盤面も調査できる
+    function findEmptyRegions(targetBoard) {
+        const visited = new Set();
+        const regions = [];
+
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                if (targetBoard[row][col] !== null) {
+                    continue;
+                }
+
+                const startKey = row + "," + col;
+                if (visited.has(startKey)) {
+                    continue;
+                }
+
+                const points = [];
+                const borderingColors = new Set();
+                const stack = [{ row, col }];
+
+                while (stack.length > 0) {
+                    const current = stack.pop();
+                    const key = current.row + "," + current.col;
+
+                    if (visited.has(key)) {
+                        continue;
+                    }
+
+                    visited.add(key);
+                    points.push(current);
+
+                    for (const [dr, dc] of directions) {
+                        const nextRow = current.row + dr;
+                        const nextCol = current.col + dc;
+
+                        if (
+                            nextRow < 0 || nextRow >= SIZE ||
+                            nextCol < 0 || nextCol >= SIZE
+                        ) {
+                            continue;
+                        }
+
+                        const nextColor = targetBoard[nextRow][nextCol];
+
+                        if (nextColor === null) {
+                            const nextKey = nextRow + "," + nextCol;
+                            if (!visited.has(nextKey)) {
+                                stack.push({ row: nextRow, col: nextCol });
+                            }
+                        } else {
+                            borderingColors.add(nextColor);
+                        }
+                    }
+                }
+
+                regions.push({ points, borderingColors });
+            }
+        }
+
+        return regions;
+    }
+
+    // グループが終局時に死に石とみなせるかを簡易判定する
+    function isDeadGroupAtEnd(group) {
+        const color = boardData[group[0].row][group[0].col];
+        const opponent = color === "black" ? "white" : "black";
+        const groupPositions = new Set(
+            group.map(stone => stone.row + "," + stone.col)
+        );
+
+        // まず、このグループに接している「自分の石だけに囲まれた空き領域」を調べる
+        // 独立した目が2つ以上あれば、生きているものとして扱う
+        let eyeCount = 0;
+        const currentRegions = findEmptyRegions(boardData);
+
+        for (const region of currentRegions) {
+            if (
+                region.borderingColors.size !== 1 ||
+                !region.borderingColors.has(color)
+            ) {
+                continue;
+            }
+
+            const touchesGroup = region.points.some(point => {
+                return directions.some(([dr, dc]) => {
+                    const key = (point.row + dr) + "," + (point.col + dc);
+                    return groupPositions.has(key);
+                });
+            });
+
+            if (touchesGroup) {
+                eyeCount++;
+            }
+        }
+
+        if (eyeCount >= 2) {
+            return false;
+        }
+
+        // グループを仮に取り除いた盤面を作る
+        const testBoard = copyBoard(boardData);
+
+        for (const stone of group) {
+            testBoard[stone.row][stone.col] = null;
+        }
+
+        // 取り除いた場所につながる空き領域が、すべて相手の石だけに
+        // 囲まれていれば、このグループは逃げられないと判定する
+        const testRegions = findEmptyRegions(testBoard);
+        let checkedRegionCount = 0;
+
+        for (const region of testRegions) {
+            const containsRemovedStone = region.points.some(point =>
+                groupPositions.has(point.row + "," + point.col)
+            );
+
+            if (!containsRemovedStone) {
+                continue;
+            }
+
+            checkedRegionCount++;
+
+            if (
+                region.borderingColors.size !== 1 ||
+                !region.borderingColors.has(opponent)
+            ) {
+                return false;
+            }
+        }
+
+        return checkedRegionCount > 0;
+    }
+
+    // 終局時に死に石を取り除き、相手の捕獲数に加える
+    function resolveDeadStones() {
+        const checked = new Set();
+        const deadGroups = [];
+
+        // まず全グループを調べる。途中で石を取り除かず、元の盤面で判定する
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+                const color = boardData[row][col];
+
+                if (color === null) {
+                    continue;
+                }
+
+                const key = row + "," + col;
+                if (checked.has(key)) {
+                    continue;
+                }
+
+                const group = findGroup(row, col);
+
+                for (const stone of group) {
+                    checked.add(stone.row + "," + stone.col);
+                }
+
+                if (isDeadGroupAtEnd(group)) {
+                    deadGroups.push({ color, stones: group });
+                }
+            }
+        }
+
+        // 判定が終わってから、死に石をまとめて取り除く
+        for (const deadGroup of deadGroups) {
+            const opponent = deadGroup.color === "black" ? "white" : "black";
+
+            for (const stone of deadGroup.stones) {
+                boardData[stone.row][stone.col] = null;
+                capturedStones[opponent]++;
+                finalDeadStones[deadGroup.color]++;
+            }
+        }
+
+        return {
+            black: finalDeadStones.black,
+            white: finalDeadStones.white
+        };
+    }
+
+    // 空き領域を調べて、黒地・白地・中立地に分類する
+    function analyzeTerritories() {
+
+        // 分類結果をいったん空にする
+        territoryData = Array.from(
+            { length: SIZE },
+            () => Array(SIZE).fill(null)
+        );
+
+        // 探索済みの空き交点を記録する
+        const visited = new Set();
+
+        // 分類結果の集計
+        const counts = {
+            black: 0,
+            white: 0,
+            neutral: 0
+        };
+
+        // 領域の数
+        const regionCounts = {
+            black: 0,
+            white: 0,
+            neutral: 0
+        };
+
+        // 盤面の全交点を調べる
+        for (let row = 0; row < SIZE; row++) {
+            for (let col = 0; col < SIZE; col++) {
+
+                // 石がある場所は探索しない
+                if (boardData[row][col] !== null) {
+                    continue;
+                }
+
+                const startKey = row + "," + col;
+
+                // すでに調べた場所なら飛ばす
+                if (visited.has(startKey)) {
+                    continue;
+                }
+
+                // 新しい空き領域を探索する
+                const region = [];
+                const stack = [
+                    { row: row, col: col }
+                ];
+
+                // この領域に接している石の色
+                const borderingColors = new Set();
+
+                while (stack.length > 0) {
+                    const current = stack.pop();
+
+                    const key =
+                        current.row + "," + current.col;
+
+                    if (visited.has(key)) {
+                        continue;
+                    }
+
+                    visited.add(key);
+                    region.push(current);
+
+                    // 上下左右を調べる
+                    for (const [dr, dc] of directions) {
+                        const nextRow = current.row + dr;
+                        const nextCol = current.col + dc;
+
+                        // 盤面の外は無視
+                        if (
+                            nextRow < 0 || nextRow >= SIZE ||
+                            nextCol < 0 || nextCol >= SIZE
+                        ) {
+                            continue;
+                        }
+
+                        const nextColor =
+                            boardData[nextRow][nextCol];
+
+                        if (nextColor === null) {
+                            // 空き交点なら探索対象に追加
+                            const nextKey =
+                                nextRow + "," + nextCol;
+
+                            if (!visited.has(nextKey)) {
+                                stack.push({
+                                    row: nextRow,
+                                    col: nextCol
+                                });
+                            }
+                        } else {
+                            // 石なら、その色を記録
+                            borderingColors.add(nextColor);
+                        }
+                    }
+                }
+
+                // 領域に接している石の色で分類する
+                let territoryColor;
+
+                if (
+                    borderingColors.size === 1 &&
+                    borderingColors.has("black")
+                ) {
+                    territoryColor = "black";
+
+                } else if (
+                    borderingColors.size === 1 &&
+                    borderingColors.has("white")
+                ) {
+                    territoryColor = "white";
+
+                } else {
+                    territoryColor = "neutral";
+                }
+
+                // 領域内の全交点に分類結果を記録
+                for (const point of region) {
+                    territoryData[point.row][point.col] =
+                        territoryColor;
+                }
+
+                // 領域の広さと領域数を集計
+                counts[territoryColor] += region.length;
+                regionCounts[territoryColor]++;
+            }
+        }
+
+        // 分類結果を画面に表示
+        renderBoard();
+
+        // 簡易ルールで得点を計算する
+        // 地の候補数 + 相手から捕獲した石の数
+        const blackScore = counts.black + capturedStones.black;
+        const whiteScore = counts.white + capturedStones.white;
+
+        let winnerMessage;
+
+        if (blackScore > whiteScore) {
+            winnerMessage = "黒の勝ちです！";
+        } else if (whiteScore > blackScore) {
+            winnerMessage = "白の勝ちです！";
+        } else {
+            winnerMessage = "引き分けです。";
+        }
+
+        document.getElementById("territoryResult").innerHTML =
+            "<strong>空き領域の分類結果（候補）</strong><br>" +
+            "黒地候補：" + counts.black + "交点（" +
+            regionCounts.black + "領域）<br>" +
+            "白地候補：" + counts.white + "交点（" +
+            regionCounts.white + "領域）<br>" +
+            "中立地候補：" + counts.neutral + "交点（" +
+            regionCounts.neutral + "領域）<br><br>" +
+            "<strong>捕獲した石の合計</strong><br>" +
+            "黒が捕獲した白石：" + capturedStones.black + "個<br>" +
+            "白が捕獲した黒石：" + capturedStones.white + "個<br>" +
+            "終局時に取り除いた黒石：" + finalDeadStones.black + "個<br>" +
+            "終局時に取り除いた白石：" + finalDeadStones.white + "個<br><br>" +
+            "<strong>簡易得点</strong><br>" +
+            "黒の得点：" + counts.black + "（黒地） + " +
+            capturedStones.black + "（捕獲） = " + blackScore + "点<br>" +
+            "白の得点：" + counts.white + "（白地） + " +
+            capturedStones.white + "（捕獲） = " + whiteScore + "点<br><br>" +
+            "<strong>" + winnerMessage + "</strong><br>" +
+            "※今回は学習用の簡易計算です。正式な囲碁の採点とは異なります。";
+    }
+
+    // 最初の盤面を表示
+    renderBoard();
+</script>
+
+</body>
+</html>
